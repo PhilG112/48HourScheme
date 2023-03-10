@@ -1,0 +1,11 @@
+ignore-project: False
+tests: True
+test-options: "--color"
+test-show-details: streaming
+library-profiling: False
+executable-profiling: False
+benchmarks: True
+documentation: True
+package *
+  documentation: True
+haddock-html: True
