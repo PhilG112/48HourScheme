@@ -15,10 +15,21 @@ symbol = oneOf "!#$%&|*+-/:<=>?@^_~"
 spaces :: Parser ()
 spaces = skipMany1 space
 
+escapedChars :: Parser Char
+escapedChars = do
+    char '\\'
+    x <- oneOf "\\\"nrt"
+    return $ case x of
+        '\\' -> x
+        '"' -> x
+        'n' -> '\n'
+        't' -> '\t'
+        'r' -> '\r'
+
 parseString :: Parser LispVal
 parseString = do
     char '"'
-    x <- many (noneOf "\"")
+    x <- many $ escapedChars <|> noneOf "\"\\"
     char '"'
     return $ String x
 
@@ -51,13 +62,13 @@ parseExpr = parseAtom <|> parseString <|> parseNumber
 readExpr :: String -> String
 readExpr input = case parse parseExpr "lisp" input of
     Left err -> "No match: " ++ show err
-    Right val -> "Found value "
+    Right val -> "Found value " ++ show val
 
 data LispVal = Atom String
     | List [LispVal]
     | DottedList [LispVal] LispVal
     | Number Integer
     | String String
-    | Bool Bool
+    | Bool Bool deriving Show
 
 
