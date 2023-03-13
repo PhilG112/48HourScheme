@@ -8,12 +8,22 @@ import Text.ParserCombinators.Parsec hiding (spaces)
 import System.Environment
 import Control.Monad
 import Numeric
+import System.IO
 
 main :: IO ()
 main = do
     args <- getArgs
     evaled <- return $ liftM show $ readExpr (head args) >>= eval
     putStrLn $ extractValue $ trapError evaled
+
+flushStr :: String -> IO ()
+flushStr s = putStr s >> hFlush stdout
+
+readPrompt :: String -> IO String
+readPrompt prompt = flushStr prompt >> getLine
+
+evalString :: String -> IO String
+evalString expr = return $ extractValue $ trapError (liftM show $ readExpr expr >>= eval)
 
 symbol :: Parser Char
 symbol = oneOf "!$%&|*+-/:<=>?@^_~"
@@ -337,7 +347,7 @@ instance Show LispError where show = showError
 type ThrowsError = Either LispError
 
 trapError :: (MonadError e m, Show e) => m String -> m String
-trapError action = catchError action (return . show)
+trapError action = catchError action (\e -> return $ show e)
 
 extractValue :: ThrowsError a -> a
 extractValue (Right val) = val
