@@ -9,12 +9,66 @@ import System.Environment
 import Control.Monad
 import Numeric
 import System.IO
+import Data.IORef
+
+type Env = IORef [(String, IORef LispVal)]
+
+nullEnv :: IO Env
+nullEnv = newIORef []
+
+type IOThrowsError a = ExceptT LispError IO a
+
+liftThrows :: ThrowsError a -> IOThrowsError a
+liftThrows (Left err) = throwError err
+liftThrows (Right val) = return val
+
+runIOThrows :: IOThrowsError String -> IO String
+runIOThrows action = runExceptT (trapError action) >>= (\v -> return $ extractValue v)
+
+isBound :: Env -> String -> IO Bool
+isBound e s = do
+    result <- readIORef e
+    return $ maybe False (const True) $ lookup s result
+
+getVar :: Env -> String -> IOThrowsError LispVal
+getVar envRef s = do
+    result <- liftIO $ readIORef envRef
+    maybe (throwError $ UnboundVar "Getting an unbound variable" s) -- Default value if lookup returns nothing
+          (\v -> liftIO $ readIORef v) -- If lookup returns a value we need to read it using readIORef ( dont' forget the lispVals are wrapped in the IOREf monad)
+          (lookup s result) -- Do the actual lookup
+
+setVar :: Env -> String -> LispVal -> IOThrowsError LispVal
+setVar envRef key value = do
+    env <- liftIO $ readIORef envRef
+    maybe (throwError $ UnboundVar "Setting an unbound variable" key)
+          (\v -> liftIO $ writeIORef v value)
+          (lookup key env)
+    return value
+
+defineVar :: Env -> String -> LispVal -> IOThrowsError LispVal
+defineVar envRef var value = do
+    alreadyDefined <- liftIO $ isBound envRef var -- is this variable already bound?
+    if alreadyDefined
+        then setVar envRef var value >> return value -- if it is bound then we just set that variable and return the value
+        else liftIO $ do -- If not bound then do the following do block
+            valueRef <- newIORef value -- create a new IORef LispVal 
+            env <- readIORef envRef -- Read the current envRef that has the existing list of variables
+            writeIORef envRef ((var, valueRef) : env) -- Write the new created IORef LispVal to the existing list by just adding it with the cons operator
+            return value -- return the value!
+
+bindVars :: Env -> [(String, LispVal)] -> IO Env
+bindVars env values = readIORef env >>= extendEnv values >>= newIORef
+    where
+        extendEnv values env = liftM (\v -> v ++ env) (mapM addValues values)
+        addValues (var, value) = do ref <- newIORef value
+                                    return (var, ref)
 
 main :: IO ()
-main = do
-    args <- getArgs
-    evaled <- return $ liftM show $ readExpr (head args) >>= eval
-    putStrLn $ extractValue $ trapError evaled
+main = do args <- getArgs
+          case length args of
+               0 -> runRepl
+               1 -> runOne $ head args
+               _ -> putStrLn "Program takes only 0 or 1 argument"
 
 flushStr :: String -> IO ()
 flushStr s = putStr s >> hFlush stdout
@@ -22,8 +76,24 @@ flushStr s = putStr s >> hFlush stdout
 readPrompt :: String -> IO String
 readPrompt prompt = flushStr prompt >> getLine
 
-evalString :: String -> IO String
-evalString expr = return $ extractValue $ trapError (liftM show $ readExpr expr >>= eval)
+evalString :: Env -> String -> IO String
+evalString env expr = runIOThrows $ liftM show $ (liftThrows $ readExpr expr) >>= eval env
+
+evalAndPrint :: Env -> String -> IO ()
+evalAndPrint env expr =  evalString env expr >>= putStrLn
+
+until_ :: Monad m => (a -> Bool) -> m a -> (a -> m ()) -> m ()
+until_ pred prompt action = do 
+   result <- prompt
+   if pred result 
+      then return ()
+      else action result >> until_ pred prompt action
+
+runOne :: String -> IO ()
+runOne expr = nullEnv >>= flip evalAndPrint expr
+
+runRepl :: IO ()
+runRepl = nullEnv >>= until_ (== "quit") (readPrompt "Lisp>>> ") . evalAndPrint
 
 symbol :: Parser Char
 symbol = oneOf "!$%&|*+-/:<=>?@^_~"
@@ -150,11 +220,10 @@ parseExpr = parseAtom
     <|> parseNumber
     <|> parseQuoted
     -- <|> parseBool
-    <|> do
-            char '('
-            x <- try parseList <|> parseDottedList
-            char ')'
-            return x
+    <|> do char '('
+           x <- try parseList <|> parseDottedList
+           char ')'
+           return x
 
 readExpr :: String -> ThrowsError LispVal
 readExpr input = case parse parseExpr "lisp" input of
@@ -183,18 +252,23 @@ showVal (DottedList head tail) = "(" ++ unwordsList head ++ " . " ++ showVal tai
 unwordsList :: [LispVal] -> String
 unwordsList = unwords . map showVal
 
-eval :: LispVal -> ThrowsError LispVal
-eval val@(String _) = return val
-eval val@(Number _) = return val
-eval val@(Bool _) = return val
-eval (List [Atom "quote", val]) = return val
-eval (List [Atom "if", pred, conseq, alt]) =
-     do result <- eval pred
+eval :: Env -> LispVal -> IOThrowsError LispVal
+eval env val@(String _) = return val
+eval env val@(Number _) = return val
+eval env val@(Bool _) = return val
+eval env (Atom id) = getVar env id
+eval env (List [Atom "quote", val]) = return val
+eval env (List [Atom "if", pred, conseq, alt]) =
+     do result <- eval env pred
         case result of
-            Bool False -> eval alt
-            _ -> eval conseq
-eval (List (Atom func : args)) = mapM eval args >>= apply func
-eval badForm = throwError $ BadSpecialForm "Unrecognized special form" badForm
+             Bool False -> eval env alt
+             otherwise -> eval env conseq
+eval env (List [Atom "set!", Atom var, form]) =
+     eval env form >>= setVar env var
+eval env (List [Atom "define", Atom var, form]) =
+     eval env form >>= defineVar env var
+eval env (List (Atom func : args)) = mapM (eval env) args >>= liftThrows . apply func
+eval env badForm = throwError $ BadSpecialForm "Unrecognized special form" badForm
 
 car :: [LispVal] -> ThrowsError LispVal
 car [List (x:xs)] = return x
