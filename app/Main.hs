@@ -10,6 +10,7 @@ import Control.Monad
 import Numeric
 import System.IO
 import Data.IORef
+import Data.Maybe
 
 type Env = IORef [(String, IORef LispVal)]
 
@@ -237,6 +238,9 @@ data LispVal = Atom String
     | String String
     | Bool Bool
     | Character Char
+    | PrimitiveFunc ([LispVal] -> ThrowsError LispVal)
+    | Func { params :: [String], vararg :: (Maybe String),
+             body :: [LispVal], closure :: Env }
 
 instance Show LispVal where show = showVal
 
@@ -248,6 +252,12 @@ showVal (Bool True) = "#t"
 showVal (Bool False) = "#f"
 showVal (List c) = "(" ++ unwordsList c ++ ")"
 showVal (DottedList head tail) = "(" ++ unwordsList head ++ " . " ++ showVal tail ++ ")"
+showVal (PrimitiveFunc _) = "<primitive>"
+showVal (Func {params = args, vararg = varargs, body = body, closure = env}) =
+    "(lambda (" ++ unwords (map show args) ++
+        (case varargs of
+            Nothing -> ""
+            Just arg -> " . " ++ arg) ++ ") ...)"
 
 unwordsList :: [LispVal] -> String
 unwordsList = unwords . map showVal
@@ -334,10 +344,24 @@ primitives = [("+", numericBinop (+)),
                 ("eqv?", eqv),
                 ("equal?", equal)]
 
-apply :: String -> [LispVal] -> ThrowsError LispVal
-apply func args = maybe (throwError $ NotFunction "Unrecognized primitive function args" func)
+applyOld :: String -> [LispVal] -> ThrowsError LispVal
+applyOld func args = maybe (throwError $ NotFunction "Unrecognized primitive function args" func)
                         ($ args)
                         (lookup func primitives)
+
+apply :: LispVal -> [LispVal] -> IOThrowsError LispVal
+apply (PrimitiveFunc func) args = liftThrows $ func args
+apply (Func params varargs body closure) args =
+    if num params /= num args && isNothing varargs
+        then throwError $ NumArgs (num params) args
+        else liftIO (bindVars closure $ zip params args) >>= bindVarArgs varargs >>= evalBody
+    where
+        remainingArgs = drop (length params) args
+        num = toInteger . length
+        evalBody env = last <$> mapM (eval env) body
+        bindVarArgs arg env = case arg of
+            Just argName -> liftIO $ bindVars env [(argName , List $ remainingArgs)]
+            Nothing -> return env
 
 boolBinop :: (LispVal -> ThrowsError a) -> (a -> a -> Bool) -> [LispVal] -> ThrowsError LispVal
 boolBinop unpacker op args = if length args /= 2
