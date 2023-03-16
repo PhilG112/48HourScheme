@@ -31,6 +31,10 @@ isBound e s = do
     result <- readIORef e
     return $ maybe False (const True) $ lookup s result
 
+primitiveBindings :: IO Env
+primitiveBindings = nullEnv >>= flip bindVars (map makePrimitiveFunc primitives)
+    where makePrimitiveFunc (var, func) = (var, PrimitiveFunc func)
+
 getVar :: Env -> String -> IOThrowsError LispVal
 getVar envRef s = do
     result <- liftIO $ readIORef envRef
@@ -91,10 +95,10 @@ until_ pred prompt action = do
       else action result >> until_ pred prompt action
 
 runOne :: String -> IO ()
-runOne expr = nullEnv >>= flip evalAndPrint expr
+runOne expr = primitiveBindings >>= flip evalAndPrint expr
 
 runRepl :: IO ()
-runRepl = nullEnv >>= until_ (== "quit") (readPrompt "Lisp>>> ") . evalAndPrint
+runRepl = primitiveBindings >>= until_ (== "quit") (readPrompt "Lisp>>> ") . evalAndPrint
 
 symbol :: Parser Char
 symbol = oneOf "!$%&|*+-/:<=>?@^_~"
@@ -226,6 +230,11 @@ parseExpr = parseAtom
            char ')'
            return x
 
+readOrThrow :: Parser a -> String -> ThrowsError a
+readOrThrow parser input = case parse parser "lisp" input of
+    Left err  -> throwError $ Parser err
+    Right val -> return val
+
 readExpr :: String -> ThrowsError LispVal
 readExpr input = case parse parseExpr "lisp" input of
     Left err -> throwError $ Parser err
@@ -241,6 +250,8 @@ data LispVal = Atom String
     | PrimitiveFunc ([LispVal] -> ThrowsError LispVal)
     | Func { params :: [String], vararg :: (Maybe String),
              body :: [LispVal], closure :: Env }
+    | IOFunc ([LispVal] -> IOThrowsError LispVal)
+    | Port Handle
 
 instance Show LispVal where show = showVal
 
@@ -258,6 +269,8 @@ showVal (Func {params = args, vararg = varargs, body = body, closure = env}) =
         (case varargs of
             Nothing -> ""
             Just arg -> " . " ++ arg) ++ ") ...)"
+showVal (Port _)   = "<IO port>"
+showVal (IOFunc _) = "<IO primitive>"
 
 unwordsList :: [LispVal] -> String
 unwordsList = unwords . map showVal
@@ -277,8 +290,30 @@ eval env (List [Atom "set!", Atom var, form]) =
      eval env form >>= setVar env var
 eval env (List [Atom "define", Atom var, form]) =
      eval env form >>= defineVar env var
-eval env (List (Atom func : args)) = mapM (eval env) args >>= liftThrows . apply func
+eval env (List (Atom "define" : List (Atom var : params) : body)) =
+     makeNormalFunc env params body >>= defineVar env var
+eval env (List (Atom "define" : DottedList (Atom var : params) varargs : body)) =
+     makeVarArgs varargs env params body >>= defineVar env var
+eval env (List (Atom "lambda" : List params : body)) =
+     makeNormalFunc env params body
+eval env (List (Atom "lambda" : DottedList params varargs : body)) =
+     makeVarArgs varargs env params body
+eval env (List (Atom "lambda" : varargs@(Atom _) : body)) =
+     makeVarArgs varargs env [] body
+eval env (List (function : args)) = do
+    func <- eval env function
+    argVals <- mapM (\a -> eval env a) args
+    apply func argVals
 eval env badForm = throwError $ BadSpecialForm "Unrecognized special form" badForm
+
+makeFunc :: Monad m => Maybe String -> Env -> [LispVal] -> [LispVal] -> m LispVal
+makeFunc varargs env params body = return $ Func (map showVal params) varargs body env
+
+makeNormalFunc :: Monad m => Env -> [LispVal] -> [LispVal] -> m LispVal
+makeNormalFunc e params body = makeFunc Nothing e params body
+
+makeVarArgs :: Monad m => LispVal -> Env -> [LispVal] -> [LispVal] -> m LispVal
+makeVarArgs lv e params body = makeFunc (Just $ showVal lv) e params body
 
 car :: [LispVal] -> ThrowsError LispVal
 car [List (x:xs)] = return x
@@ -362,6 +397,7 @@ apply (Func params varargs body closure) args =
         bindVarArgs arg env = case arg of
             Just argName -> liftIO $ bindVars env [(argName , List $ remainingArgs)]
             Nothing -> return env
+apply (IOFunc func) args = func args
 
 boolBinop :: (LispVal -> ThrowsError a) -> (a -> a -> Bool) -> [LispVal] -> ThrowsError LispVal
 boolBinop unpacker op args = if length args /= 2
